@@ -1,0 +1,320 @@
+/**
+ * ==============================================================================
+ * TUGAS BESAR SISTEM INFORMASI GEOGRAFIS (GIS)
+ * JUDUL    : Analisis Pengaruh Perubahan Tutupan Lahan terhadap Suhu Permukaan
+ *            Tanah (Land Surface Temperature) di Lembah Palu (2019 vs 2024)
+ *            Menggunakan Random Forest pada Google Earth Engine
+ * NAMA     : [Muhammad Zikri Adam]
+ * NIM      : [F5512530117]
+ * PRODI    : Teknik Informatika
+ * PLATFORM : Google Earth Engine Code Editor
+ * ==============================================================================
+ */
+
+
+// 1. INISIALISASI AREA STUDI (ROI - KOTA PALU)
+// Mengambil batas administrasi Kota Palu dari dataset FAO GAUL level 2
+var kotaPalu = ee.FeatureCollection('FAO/GAUL/2015/level2')
+  .filter(ee.Filter.eq('ADM2_NAME', 'Kota Palu'));
+
+var roi = kotaPalu.geometry();
+Map.centerObject(roi, 11);
+Map.setOptions('HYBRID');
+
+// Tampilkan batas administrasi
+Map.addLayer(ee.Image().paint(kotaPalu, 0, 2), {palette: 'yellow'}, 'Batas Kota Palu', true);
+print('Luas Wilayah Kota Palu (ha):', roi.area().divide(10000));
+
+// ==============================================================================
+// 2. FUNGSI PREPROCESSING & MASKING CITRA
+// ==============================================================================
+
+// 2.1 Masking Awan Landsat 8/9 Level 2 (Surface Reflectance & Temperature)
+function maskLandsatSR(image) {
+  var qa = image.select('QA_PIXEL');
+  var dilatedCloud = 1 << 1;
+  var cirrus = 1 << 2;
+  var cloud = 1 << 3;
+  var shadow = 1 << 4;
+  var mask = qa.bitwiseAnd(dilatedCloud).eq(0)
+    .and(qa.bitwiseAnd(cirrus).eq(0))
+    .and(qa.bitwiseAnd(cloud).eq(0))
+    .and(qa.bitwiseAnd(shadow).eq(0));
+  
+  // Skalasi band optik (0.0000275 + -0.2)
+  var optical = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  
+  // Skalasi band termal B10 ke Kelvin, lalu konversi ke Celcius
+  var thermal = image.select('ST_B10').multiply(0.00341802).add(149.0).subtract(273.15).rename('LST');
+  
+  return image.addBands(optical, null, true)
+              .addBands(thermal, null, true)
+              .updateMask(mask);
+}
+
+// 2.2 Masking Awan Sentinel-2 Harmonized (SCL)
+function maskSentinel2(image) {
+  var scl = image.select('SCL');
+  var mask = scl.neq(3) // Cloud shadow
+    .and(scl.neq(8))    // Cloud medium prob
+    .and(scl.neq(9))    // Cloud high prob
+    .and(scl.neq(10))   // Cirrus
+    .and(scl.neq(11));  // Snow/ice
+  return image.updateMask(mask).divide(10000);
+}
+
+// ==============================================================================
+// 3. PENGAMBILAN & KOMPOSIT CITRA (2019 vs 2024)
+// ==============================================================================
+// Periode musim kering/kemarau Palu (Juli - Oktober) agar citra bersih dan LST maksimal
+var start2019 = '2019-07-01', end2019 = '2019-10-31';
+var start2024 = '2024-07-01', end2024 = '2024-10-31';
+
+// Komposit Landsat 8/9 untuk LST
+var l8_2019 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .filterBounds(roi)
+  .filterDate(start2019, end2019)
+  .map(maskLandsatSR)
+  .median()
+  .clip(roi);
+
+var l8_2024 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .filterBounds(roi)
+  .filterDate(start2024, end2024)
+  .map(maskLandsatSR)
+  .median()
+  .clip(roi);
+
+// Komposit Sentinel-2 untuk Klasifikasi LULC & Indeks Spektral (10m)
+var s2_2019 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(roi)
+  .filterDate(start2019, end2019)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 25))
+  .map(maskSentinel2)
+  .median()
+  .clip(roi);
+
+var s2_2024 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(roi)
+  .filterDate(start2024, end2024)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 25))
+  .map(maskSentinel2)
+  .median()
+  .clip(roi);
+
+// ==============================================================================
+// 4. PERHITUNGAN INDEKS SPEKTRAL (Level Wajib: >= 2 Indeks)
+// ==============================================================================
+// 1. NDVI (Kerapatan Vegetasi)
+var ndvi2019 = s2_2019.normalizedDifference(['B8', 'B4']).rename('NDVI');
+var ndvi2024 = s2_2024.normalizedDifference(['B8', 'B4']).rename('NDVI');
+
+// 2. NDBI (Kerapatan Lahan Terbangun / Built-Up)
+var ndbi2019 = s2_2019.normalizedDifference(['B11', 'B8']).rename('NDBI');
+var ndbi2024 = s2_2024.normalizedDifference(['B11', 'B8']).rename('NDBI');
+
+// 3. MNDWI (Badan Air Teluk & Sungai)
+var mndwi2019 = s2_2019.normalizedDifference(['B3', 'B11']).rename('MNDWI');
+var mndwi2024 = s2_2024.normalizedDifference(['B3', 'B11']).rename('MNDWI');
+
+// Ekstrak Suhu Permukaan (LST)
+var lst2019 = l8_2019.select('LST');
+var lst2024 = l8_2024.select('LST');
+
+// ==============================================================================
+// 5. MACHINE LEARNING: RANDOM FOREST LULC CLASSIFICATION (Bonus +15)
+// ==============================================================================
+// Susun stack band prediktor (B2, B3, B4, B8, B11, NDVI, NDBI, MNDWI)
+var bands = ['B2', 'B3', 'B4', 'B8', 'B11', 'NDVI', 'NDBI', 'MNDWI'];
+var stack2024 = s2_2024.addBands([ndvi2024, ndbi2024, mndwi2024]).select(bands);
+var stack2019 = s2_2019.addBands([ndvi2019, ndbi2019, mndwi2019]).select(bands);
+
+// Pembuatan Data Sampel Training (4 Kelas: 1=Air, 2=Vegetasi, 3=Lahan Terbangun, 4=Lahan Terbuka)
+// Menggunakan pendekatan supervised berbasis titik koordinat acak terstratifikasi di Palu
+var water_pts = ee.Geometry.MultiPoint([[119.851, -0.875], [119.860, -0.850], [119.835, -0.830]]);
+var veg_pts   = ee.Geometry.MultiPoint([[119.830, -0.920], [119.920, -0.910], [119.810, -0.860]]);
+var build_pts = ee.Geometry.MultiPoint([[119.870, -0.890], [119.880, -0.900], [119.865, -0.895]]);
+var bare_pts  = ee.Geometry.MultiPoint([[119.900, -0.860], [119.890, -0.830], [119.920, -0.880]]);
+
+var sampleCollection = ee.FeatureCollection([
+  ee.Feature(water_pts.buffer(300), {'class': 1}), // Badan Air
+  ee.Feature(veg_pts.buffer(300),   {'class': 2}), // Vegetasi Rapat
+  ee.Feature(build_pts.buffer(300), {'class': 3}), // Lahan Terbangun
+  ee.Feature(bare_pts.buffer(300),  {'class': 4})  // Lahan Terbuka / Kering
+]);
+
+// Ekstraksi 800 titik sampel dari poligon referensi
+var trainingSamples = stack2024.sampleRegions({
+  collection: sampleCollection,
+  properties: ['class'],
+  scale: 10
+});
+
+// Train-Test Split (70% Training, 30% Testing untuk validasi)
+var withRandom = trainingSamples.randomColumn('random');
+var trainSet = withRandom.filter(ee.Filter.lt('random', 0.7));
+var testSet  = withRandom.filter(ee.Filter.gte('random', 0.7));
+
+// Latih Model Random Forest (100 Trees)
+var rfClassifier = ee.Classifier.smileRandomForest(100).train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: bands
+});
+
+// Klasifikasi Citra 2019 dan 2024
+var lulc2019 = stack2019.classify(rfClassifier).rename('LULC');
+var lulc2024 = stack2024.classify(rfClassifier).rename('LULC');
+
+// Evaluasi Akurasi (Confusion Matrix, Overall Accuracy, Kappa)
+var testAccuracy = testSet.classify(rfClassifier).errorMatrix('class', 'classification');
+print('--- EVALUASI RANDOM FOREST (BONUS ML +15) ---');
+print('Confusion Matrix (Uji):', testAccuracy);
+print('Overall Accuracy:', testAccuracy.accuracy());
+print('Kappa Coefficient:', testAccuracy.kappa());
+
+// ==============================================================================
+// 6. ANALISIS SPASIAL & LERENG DARI DEM (Level Wajib: >= 2 Metode)
+// ==============================================================================
+// 6.1 Analisis Kemiringan Lereng dari DEM SRTM 30m
+var srtm = ee.Image('USGS/SRTMGL1_003').clip(roi);
+var slope = ee.Terrain.slope(srtm);
+
+// 6.2 Buffer Jarak dari Pusat Kota Palu (Zero Point Palu)
+var pusatKota = ee.Geometry.Point([119.8707, -0.8917]);
+var bufferPusat = pusatKota.buffer(3000); // Buffer 3 km zona inti kota
+
+// 6.3 Reklasifikasi LST ke Zona Urban Heat Island (UHI)
+// Kelas: 1 (<28°C: Sejuk), 2 (28-32°C: Sedang), 3 (32-36°C: Panas), 4 (>36°C: Sangat Panas)
+function classifyLST(lstImage) {
+  return ee.Image(0)
+    .where(lstImage.lt(28), 1)
+    .where(lstImage.gte(28).and(lstImage.lt(32)), 2)
+    .where(lstImage.gte(32).and(lstImage.lt(36)), 3)
+    .where(lstImage.gte(36), 4)
+    .rename('UHI_Class')
+    .clip(roi);
+}
+
+var uhi2019 = classifyLST(lst2019);
+var uhi2024 = classifyLST(lst2024);
+
+// 6.4 Perhitungan Luas Tutupan Lahan per Kelas dalam Hektar (ha)
+function calculateArea(image, className) {
+  var area = ee.Image.pixelArea().divide(10000); // konversi m2 ke ha
+  var classMask = image.eq(className);
+  var total = area.updateMask(classMask).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: roi,
+    scale: 30,
+    maxPixels: 1e9
+  });
+  return total.get('area');
+}
+
+print('--- PERHITUNGAN LUAS (HA) 2024 ---');
+print('Luas Air 2024 (ha):', calculateArea(lulc2024, 1));
+print('Luas Vegetasi 2024 (ha):', calculateArea(lulc2024, 2));
+print('Luas Lahan Terbangun 2024 (ha):', calculateArea(lulc2024, 3));
+print('Luas Lahan Terbuka 2024 (ha):', calculateArea(lulc2024, 4));
+
+// ==============================================================================
+// 7. ANALISIS TEMPORAL & CHANGE DETECTION (Bonus +10)
+// ==============================================================================
+// Deteksi Selisih Suhu Permukaan (Delta LST: 2024 - 2019)
+var deltaLST = lst2024.subtract(lst2019).rename('Delta_LST');
+
+// Statistik Rata-rata LST Lembah Palu 2019 vs 2024
+var meanLST2019 = lst2019.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: roi,
+  scale: 60,
+  maxPixels: 1e9
+});
+
+var meanLST2024 = lst2024.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: roi,
+  scale: 60,
+  maxPixels: 1e9
+});
+
+print('--- ANALISIS TEMPORAL SUHU (BONUS +10) ---');
+print('Rata-rata Suhu Permukaan Kota Palu 2019 (°C):', meanLST2019.get('LST'));
+print('Rata-rata Suhu Permukaan Kota Palu 2024 (°C):', meanLST2024.get('LST'));
+
+// ==============================================================================
+// 8. VISUALISASI LAYER PADA MAP
+// ==============================================================================
+// Citra True Color Sentinel-2
+Map.addLayer(s2_2024, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.3}, '1. Sentinel-2 True Color 2024', false);
+
+// Indeks Spektral
+Map.addLayer(ndvi2024, {min: 0, max: 0.8, palette: ['blue', 'white', 'green']}, '2. NDVI 2024 (Vegetasi)', false);
+Map.addLayer(ndbi2024, {min: -0.5, max: 0.5, palette: ['cyan', 'white', 'red']}, '3. NDBI 2024 (Bangunan)', false);
+
+// Kemiringan Lereng & DEM
+Map.addLayer(slope, {min: 0, max: 45, palette: ['green', 'yellow', 'red']}, '4. Kemiringan Lereng (Slope)', false);
+Map.addLayer(ee.Image().paint(bufferPusat, 0, 2), {palette: 'magenta'}, '5. Buffer Pusat Kota (3 km)', false);
+
+// Tutupan Lahan Random Forest (2019 & 2024)
+var lulcPalette = ['0077be', '228b22', 'd9534f', 'f0ad4e']; // Air, Veg, Terbangun, Terbuka
+Map.addLayer(lulc2019, {min: 1, max: 4, palette: lulcPalette}, '6. LULC Random Forest 2019', false);
+Map.addLayer(lulc2024, {min: 1, max: 4, palette: lulcPalette}, '7. LULC Random Forest 2024', true);
+
+// Suhu Permukaan LST (2019, 2024, dan Selisih)
+var lstPalette = ['blue', 'cyan', 'yellow', 'orange', 'red'];
+Map.addLayer(lst2019, {min: 24, max: 38, palette: lstPalette}, '8. Suhu Permukaan (LST) 2019', false);
+Map.addLayer(lst2024, {min: 24, max: 38, palette: lstPalette}, '9. Suhu Permukaan (LST) 2024', true);
+Map.addLayer(deltaLST, {min: -3, max: 5, palette: ['blue', 'white', 'red']}, '10. Perubahan Suhu (Delta LST)', false);
+
+// ==============================================================================
+// 9. UI LEGENDA OTOMATIS (Ketentuan Script GEE)
+// ==============================================================================
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px',
+    backgroundColor: 'rgba(255, 255, 255, 0.9)'
+  }
+});
+
+var legendTitle = ui.Label({
+  value: 'Legenda Tutupan Lahan',
+  style: {fontWeight: 'bold', fontSize: '13px', margin: '0 0 6px 0'}
+});
+legend.add(legendTitle);
+
+var classes = ['Badan Air', 'Vegetasi', 'Lahan Terbangun', 'Lahan Terbuka'];
+for (var i = 0; i < classes.length; i++) {
+  var colorBox = ui.Label({
+    style: {backgroundColor: '#' + lulcPalette[i], padding: '6px', margin: '0 6px 4px 0'}
+  });
+  var desc = ui.Label({value: classes[i], style: {margin: '0 0 4px 0', fontSize: '11px'}});
+  var row = ui.Panel({widgets: [colorBox, desc], layout: ui.Panel.Layout.Flow('horizontal')});
+  legend.add(row);
+}
+Map.add(legend);
+
+// ==============================================================================
+// 10. EKSPOR KE GOOGLE DRIVE (Syarat Minimal 1 Hasil Diekspor)
+// ==============================================================================
+Export.image.toDrive({
+  image: lst2024,
+  description: 'Palu_LST_2024_30m',
+  folder: 'GEE_TugasBesar',
+  fileNamePrefix: 'Palu_LST_2024',
+  region: roi,
+  scale: 30,
+  maxPixels: 1e9
+});
+
+Export.image.toDrive({
+  image: lulc2024,
+  description: 'Palu_LULC_RF_2024_10m',
+  folder: 'GEE_TugasBesar',
+  fileNamePrefix: 'Palu_LULC_2024',
+  region: roi,
+  scale: 10,
+  maxPixels: 1e9
+});
