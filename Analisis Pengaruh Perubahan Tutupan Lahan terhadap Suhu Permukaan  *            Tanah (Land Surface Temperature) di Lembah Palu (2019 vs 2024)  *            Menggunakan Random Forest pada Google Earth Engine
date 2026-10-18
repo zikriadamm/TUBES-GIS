@@ -25,9 +25,8 @@ Map.setOptions('HYBRID');
 Map.addLayer(ee.Image().paint(kotaPalu, 0, 2), {palette: 'yellow'}, 'Batas Kota Palu', true);
 print('Luas Wilayah Kota Palu (ha):', roi.area().divide(10000));
 
-// ==============================================================================
+
 // 2. FUNGSI PREPROCESSING & MASKING CITRA
-// ==============================================================================
 
 // 2.1 Masking Awan Landsat 8/9 Level 2 (Surface Reflectance & Temperature)
 function maskLandsatSR(image) {
@@ -63,9 +62,8 @@ function maskSentinel2(image) {
   return image.updateMask(mask).divide(10000);
 }
 
-// ==============================================================================
+
 // 3. PENGAMBILAN & KOMPOSIT CITRA (2019 vs 2024)
-// ==============================================================================
 // Periode musim kering/kemarau Palu (Juli - Oktober) agar citra bersih dan LST maksimal
 var start2019 = '2019-07-01', end2019 = '2019-10-31';
 var start2024 = '2024-07-01', end2024 = '2024-10-31';
@@ -102,9 +100,8 @@ var s2_2024 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
   .median()
   .clip(roi);
 
-// ==============================================================================
+
 // 4. PERHITUNGAN INDEKS SPEKTRAL (Level Wajib: >= 2 Indeks)
-// ==============================================================================
 // 1. NDVI (Kerapatan Vegetasi)
 var ndvi2019 = s2_2019.normalizedDifference(['B8', 'B4']).rename('NDVI');
 var ndvi2024 = s2_2024.normalizedDifference(['B8', 'B4']).rename('NDVI');
@@ -121,9 +118,7 @@ var mndwi2024 = s2_2024.normalizedDifference(['B3', 'B11']).rename('MNDWI');
 var lst2019 = l8_2019.select('LST');
 var lst2024 = l8_2024.select('LST');
 
-// ==============================================================================
 // 5. MACHINE LEARNING: RANDOM FOREST LULC CLASSIFICATION (Bonus +15)
-// ==============================================================================
 // Susun stack band prediktor (B2, B3, B4, B8, B11, NDVI, NDBI, MNDWI)
 var bands = ['B2', 'B3', 'B4', 'B8', 'B11', 'NDVI', 'NDBI', 'MNDWI'];
 var stack2024 = s2_2024.addBands([ndvi2024, ndbi2024, mndwi2024]).select(bands);
@@ -173,9 +168,8 @@ print('Confusion Matrix (Uji):', testAccuracy);
 print('Overall Accuracy:', testAccuracy.accuracy());
 print('Kappa Coefficient:', testAccuracy.kappa());
 
-// ==============================================================================
+
 // 6. ANALISIS SPASIAL & LERENG DARI DEM (Level Wajib: >= 2 Metode)
-// ==============================================================================
 // 6.1 Analisis Kemiringan Lereng dari DEM SRTM 30m
 var srtm = ee.Image('USGS/SRTMGL1_003').clip(roi);
 var slope = ee.Terrain.slope(srtm);
@@ -218,9 +212,8 @@ print('Luas Vegetasi 2024 (ha):', calculateArea(lulc2024, 2));
 print('Luas Lahan Terbangun 2024 (ha):', calculateArea(lulc2024, 3));
 print('Luas Lahan Terbuka 2024 (ha):', calculateArea(lulc2024, 4));
 
-// ==============================================================================
+
 // 7. ANALISIS TEMPORAL & CHANGE DETECTION (Bonus +10)
-// ==============================================================================
 // Deteksi Selisih Suhu Permukaan (Delta LST: 2024 - 2019)
 var deltaLST = lst2024.subtract(lst2019).rename('Delta_LST');
 
@@ -243,9 +236,8 @@ print('--- ANALISIS TEMPORAL SUHU (BONUS +10) ---');
 print('Rata-rata Suhu Permukaan Kota Palu 2019 (°C):', meanLST2019.get('LST'));
 print('Rata-rata Suhu Permukaan Kota Palu 2024 (°C):', meanLST2024.get('LST'));
 
-// ==============================================================================
+
 // 8. VISUALISASI LAYER PADA MAP
-// ==============================================================================
 // Citra True Color Sentinel-2
 Map.addLayer(s2_2024, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.3}, '1. Sentinel-2 True Color 2024', false);
 
@@ -268,9 +260,8 @@ Map.addLayer(lst2019, {min: 24, max: 38, palette: lstPalette}, '8. Suhu Permukaa
 Map.addLayer(lst2024, {min: 24, max: 38, palette: lstPalette}, '9. Suhu Permukaan (LST) 2024', true);
 Map.addLayer(deltaLST, {min: -3, max: 5, palette: ['blue', 'white', 'red']}, '10. Perubahan Suhu (Delta LST)', false);
 
-// ==============================================================================
+
 // 9. UI LEGENDA OTOMATIS (Ketentuan Script GEE)
-// ==============================================================================
 var legend = ui.Panel({
   style: {
     position: 'bottom-left',
@@ -296,9 +287,8 @@ for (var i = 0; i < classes.length; i++) {
 }
 Map.add(legend);
 
-// ==============================================================================
+
 // 10. EKSPOR KE GOOGLE DRIVE (Syarat Minimal 1 Hasil Diekspor)
-// ==============================================================================
 Export.image.toDrive({
   image: lst2024,
   description: 'Palu_LST_2024_30m',
